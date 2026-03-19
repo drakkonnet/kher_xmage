@@ -4,6 +4,9 @@ import mage.abilities.Ability;
 import mage.abilities.ActivatedAbility;
 import mage.cards.Card;
 import mage.constants.CardType;
+import mage.game.combat.CombatGroup;
+import mage.game.permanent.Permanent;
+import mage.game.permanent.PermanentToken;
 import mage.game.Game;
 import mage.game.stack.StackObject;
 import mage.players.Player;
@@ -52,7 +55,11 @@ final class OllamaBridgeClient {
             action.put("type", resolveActionType(ability));
             action.put("label", abilityInfoBuilderPrefix + ability.toString());
             action.put("manaValue", ability.getManaCosts().manaValue());
+            action.put("manaCost", String.valueOf(ability.getManaCosts()));
             action.put("tags", buildActionTags(ability, game));
+            action.put("source", buildActionSourceView(ability, game));
+            action.put("timing", buildActionTimingView(game, player));
+            action.put("features", buildActionFeatures(ability, game, player));
             legalActions.add(action);
         }
 
@@ -60,8 +67,9 @@ final class OllamaBridgeClient {
         payload.put("game", buildGameView(game, player));
         payload.put("agent", buildAgentView(player));
         payload.put("decisionContext", buildDecisionContext(game));
-        payload.put("players", buildPlayersView(game));
+        payload.put("players", buildPlayersView(game, player));
         payload.put("stack", buildStackView(game));
+        payload.put("combat", buildCombatView(game));
         payload.put("legalActions", legalActions);
 
         String response = postJson("/v1/decide", SimpleJson.stringify(payload));
@@ -95,6 +103,10 @@ final class OllamaBridgeClient {
         gameView.put("priorityPlayerId", stringifyUuid(game.getPriorityPlayerId()));
         gameView.put("format", game.getGameType() != null ? game.getGameType().toString() : null);
         gameView.put("matchType", game.getNumPlayers() > 2 ? "MULTIPLAYER" : "DUEL");
+        gameView.put("activePlayerName", game.getPlayer(game.getActivePlayerId()) != null ? game.getPlayer(game.getActivePlayerId()).getName() : null);
+        gameView.put("priorityPlayerName", game.getPlayer(game.getPriorityPlayerId()) != null ? game.getPlayer(game.getPriorityPlayerId()).getName() : null);
+        gameView.put("isMyTurn", player.getId().equals(game.getActivePlayerId()));
+        gameView.put("isMyPriority", player.getId().equals(game.getPriorityPlayerId()));
         return gameView;
     }
 
@@ -116,6 +128,8 @@ final class OllamaBridgeClient {
     private Map<String, Object> buildDecisionContext(Game game) {
         Map<String, Object> context = new LinkedHashMap<String, Object>();
         context.put("turnsSinceAction", 0);
+        context.put("stackDepth", game.getStack().size());
+        context.put("combatActive", !game.getCombat().getAttackers().isEmpty() || !game.getCombat().getBlockers().isEmpty());
         List<Map<String, Object>> actionHistory = new ArrayList<Map<String, Object>>();
         Map<String, Object> recent = new LinkedHashMap<String, Object>();
         recent.put("turn", game.getState().getTurnNum());
@@ -126,7 +140,7 @@ final class OllamaBridgeClient {
         return context;
     }
 
-    private List<Map<String, Object>> buildPlayersView(Game game) {
+    private List<Map<String, Object>> buildPlayersView(Game game, Player perspectivePlayer) {
         List<Map<String, Object>> players = new ArrayList<Map<String, Object>>();
         for (UUID playerId : game.getPlayerList()) {
             Player current = game.getPlayer(playerId);
@@ -141,7 +155,11 @@ final class OllamaBridgeClient {
             item.put("energy", current.getCountersCount("energy"));
             item.put("handCount", current.getHand().size());
             item.put("libraryCount", current.getLibrary().size());
+            item.put("graveyardCount", current.getGraveyard().size());
             item.put("battlefield", buildBattlefieldView(game, current));
+            if (current.getId().equals(perspectivePlayer.getId())) {
+                item.put("hand", buildHandView(game, current));
+            }
             players.add(item);
         }
         return players;
@@ -149,16 +167,42 @@ final class OllamaBridgeClient {
 
     private List<Map<String, Object>> buildBattlefieldView(Game game, Player player) {
         List<Map<String, Object>> battlefield = new ArrayList<Map<String, Object>>();
-        for (mage.game.permanent.Permanent permanent : game.getBattlefield().getAllActivePermanents(player.getId())) {
+        for (Permanent permanent : game.getBattlefield().getAllActivePermanents(player.getId())) {
             Map<String, Object> item = new LinkedHashMap<String, Object>();
             item.put("name", permanent.getName());
             item.put("power", permanent.getPower().getValue());
             item.put("toughness", permanent.getToughness().getValue());
             item.put("tapped", permanent.isTapped());
-            item.put("summoningSick", Boolean.FALSE);
+            item.put("manaValue", permanent.getManaValue());
+            item.put("types", stringifyList(permanent.getCardType(game)));
+            item.put("subtypes", stringifyList(permanent.getSubtype(game)));
+            item.put("colors", extractColors(permanent.getColor(game)));
+            item.put("token", permanent instanceof PermanentToken);
+            item.put("attacking", permanent.isAttacking());
+            item.put("blocking", permanent.getBlocking() > 0);
+            item.put("canAttack", permanent.canAttack(null, game));
+            item.put("canBlock", permanent.canBlock(null, game));
+            item.put("summoningSick", permanent.isCreature(game) && !permanent.canAttack(null, game) && !permanent.isAttacking());
+            item.put("counters", permanent.getCounters(game).toString());
             battlefield.add(item);
         }
         return battlefield;
+    }
+
+    private List<Map<String, Object>> buildHandView(Game game, Player player) {
+        List<Map<String, Object>> hand = new ArrayList<Map<String, Object>>();
+        for (Card card : player.getHand().getCards(game)) {
+            Map<String, Object> item = new LinkedHashMap<String, Object>();
+            item.put("name", card.getName());
+            item.put("manaValue", card.getManaValue());
+            item.put("manaCost", String.valueOf(card.getManaCost()));
+            item.put("types", stringifyList(card.getCardType(game)));
+            item.put("subtypes", stringifyList(card.getSubtype(game)));
+            item.put("colors", extractColors(card.getColor(game)));
+            item.put("tags", buildCardTags(card));
+            hand.add(item);
+        }
+        return hand;
     }
 
     private List<Map<String, Object>> buildStackView(Game game) {
@@ -168,9 +212,51 @@ final class OllamaBridgeClient {
             item.put("controllerId", stringifyUuid(stackObject.getControllerId()));
             item.put("name", stackObject.getName());
             item.put("type", stackObject.getStackAbility() != null ? "ABILITY" : "SPELL");
+            item.put("manaValue", stackObject.getManaValue());
+            item.put("colors", extractColors(stackObject.getColor(game)));
+            item.put("subtypes", stringifyList(stackObject.getSubtype(game)));
             stack.add(item);
         }
         return stack;
+    }
+
+    private Map<String, Object> buildCombatView(Game game) {
+        Map<String, Object> combat = new LinkedHashMap<String, Object>();
+        combat.put("attackingPlayerId", stringifyUuid(game.getCombat().getAttackingPlayerId()));
+        combat.put("attackers", buildCombatGroups(game));
+        return combat;
+    }
+
+    private List<Map<String, Object>> buildCombatGroups(Game game) {
+        List<Map<String, Object>> groups = new ArrayList<Map<String, Object>>();
+        for (CombatGroup group : game.getCombat().getGroups()) {
+            Map<String, Object> item = new LinkedHashMap<String, Object>();
+            item.put("defenderId", stringifyUuid(group.getDefenderId()));
+            item.put("defendingPlayerId", stringifyUuid(group.getDefendingPlayerId()));
+            item.put("attackers", buildCombatPermanentList(game, group.getAttackers()));
+            item.put("blockers", buildCombatPermanentList(game, group.getBlockers()));
+            groups.add(item);
+        }
+        return groups;
+    }
+
+    private List<Map<String, Object>> buildCombatPermanentList(Game game, List<UUID> permanentIds) {
+        List<Map<String, Object>> permanents = new ArrayList<Map<String, Object>>();
+        for (UUID permanentId : permanentIds) {
+            Permanent permanent = game.getPermanent(permanentId);
+            if (permanent == null) {
+                continue;
+            }
+            Map<String, Object> item = new LinkedHashMap<String, Object>();
+            item.put("id", stringifyUuid(permanent.getId()));
+            item.put("name", permanent.getName());
+            item.put("power", permanent.getPower().getValue());
+            item.put("toughness", permanent.getToughness().getValue());
+            item.put("colors", extractColors(permanent.getColor(game)));
+            item.put("types", stringifyList(permanent.getCardType(game)));
+            permanents.add(item);
+        }
+        return permanents;
     }
 
     private Map<String, Object> buildMulliganView(Game game, Player player, List<Card> handCards) {
@@ -216,6 +302,92 @@ final class OllamaBridgeClient {
         return tags;
     }
 
+    private Map<String, Object> buildActionSourceView(ActivatedAbility ability, Game game) {
+        Map<String, Object> source = new LinkedHashMap<String, Object>();
+        source.put("sourceId", stringifyUuid(ability.getSourceId()));
+        Card sourceCard = ability.getSourceId() != null ? game.getCard(ability.getSourceId()) : null;
+        Permanent sourcePermanent = ability.getSourceId() != null ? game.getPermanent(ability.getSourceId()) : null;
+        if (sourceCard != null) {
+            source.put("name", sourceCard.getName());
+            source.put("manaValue", sourceCard.getManaValue());
+            source.put("types", stringifyList(sourceCard.getCardType(game)));
+            source.put("subtypes", stringifyList(sourceCard.getSubtype(game)));
+            source.put("colors", extractColors(sourceCard.getColor(game)));
+        } else if (sourcePermanent != null) {
+            source.put("name", sourcePermanent.getName());
+            source.put("manaValue", sourcePermanent.getManaValue());
+            source.put("types", stringifyList(sourcePermanent.getCardType(game)));
+            source.put("subtypes", stringifyList(sourcePermanent.getSubtype(game)));
+            source.put("colors", extractColors(sourcePermanent.getColor(game)));
+        }
+        return source;
+    }
+
+    private Map<String, Object> buildActionTimingView(Game game, Player player) {
+        Map<String, Object> timing = new LinkedHashMap<String, Object>();
+        timing.put("phase", game.getTurn() != null && game.getTurn().getPhase() != null ? game.getTurn().getPhase().getType().name() : null);
+        timing.put("step", game.getTurnStepType() != null ? game.getTurnStepType().name() : null);
+        timing.put("isMyTurn", player.getId().equals(game.getActivePlayerId()));
+        timing.put("stackDepth", game.getStack().size());
+        return timing;
+    }
+
+    private Map<String, Object> buildActionFeatures(ActivatedAbility ability, Game game, Player player) {
+        Map<String, Object> features = new LinkedHashMap<String, Object>();
+        String text = ability.toString().toLowerCase();
+        Card sourceCard = ability.getSourceId() != null ? game.getCard(ability.getSourceId()) : null;
+        Permanent sourcePermanent = ability.getSourceId() != null ? game.getPermanent(ability.getSourceId()) : null;
+        boolean isLandDrop = text.contains("play ") && text.contains("land");
+        boolean isCreatureSpell = sourceCard != null && sourceCard.isCreature();
+        boolean isPlaneswalkerSpell = sourceCard != null && sourceCard.getCardType().contains(CardType.PLANESWALKER);
+        boolean isRemoval = text.contains("destroy target")
+                || text.contains("exile target")
+                || text.contains("counter target")
+                || (text.contains("damage") && text.contains("target"));
+        boolean faceDamage = text.contains("targeting opponent") || text.contains("any target") || text.contains("target player");
+        boolean cardDraw = text.contains("draw");
+        boolean manaDevelopment = ability.isManaAbility() || isLandDrop || text.contains("add ") && text.contains("mana");
+        int manaValue = ability.getManaCosts().manaValue();
+        int sourcePower = sourceCard != null && sourceCard.isCreature() ? sourceCard.getPower().getValue() : 0;
+        if (sourcePermanent != null && sourcePermanent.isCreature(game)) {
+            sourcePower = Math.max(sourcePower, sourcePermanent.getPower().getValue());
+        }
+
+        features.put("isPass", "PASS_PRIORITY".equals(resolveActionType(ability)));
+        features.put("isLandDrop", isLandDrop);
+        features.put("isManaDevelopment", manaDevelopment);
+        features.put("isCreatureSpell", isCreatureSpell);
+        features.put("isPlaneswalkerSpell", isPlaneswalkerSpell);
+        features.put("isRemoval", isRemoval);
+        features.put("isFaceDamage", faceDamage);
+        features.put("isCardDraw", cardDraw);
+        features.put("usesStack", ability.isUsesStack());
+        features.put("commitsToBoard", isCreatureSpell || isPlaneswalkerSpell || isLandDrop);
+        features.put("manaValue", manaValue);
+        features.put("threatDelta", isCreatureSpell ? sourcePower : isPlaneswalkerSpell ? 3 : 0);
+        features.put("tempoDelta", estimateTempoDelta(isLandDrop, manaDevelopment, isCreatureSpell, manaValue, sourcePower));
+        features.put("cardAdvantageDelta", cardDraw ? 1 : 0);
+        features.put("interactionDelta", isRemoval ? 2 : faceDamage ? 1 : 0);
+        return features;
+    }
+
+    private int estimateTempoDelta(boolean isLandDrop, boolean manaDevelopment, boolean isCreatureSpell, int manaValue, int sourcePower) {
+        int tempo = 0;
+        if (isLandDrop) {
+            tempo += 2;
+        }
+        if (manaDevelopment) {
+            tempo += 1;
+        }
+        if (isCreatureSpell) {
+            tempo += Math.max(1, sourcePower);
+            if (manaValue <= 2) {
+                tempo += 1;
+            }
+        }
+        return tempo;
+    }
+
     private List<String> buildCardTags(Card card) {
         List<String> tags = new ArrayList<String>();
         if (card.isLand()) {
@@ -251,6 +423,48 @@ final class OllamaBridgeClient {
             return "CAST_SPELL";
         }
         return "ACTIVATE_ABILITY";
+    }
+
+    private List<String> stringifyList(Iterable<?> values) {
+        List<String> result = new ArrayList<String>();
+        if (values == null) {
+            return result;
+        }
+        for (Object value : values) {
+            result.add(String.valueOf(value));
+        }
+        return result;
+    }
+
+    private List<String> extractColors(Object colorObject) {
+        List<String> colors = new ArrayList<String>();
+        if (colorObject == null) {
+            return colors;
+        }
+        String raw = colorObject.toString();
+        for (int i = 0; i < raw.length(); i++) {
+            char symbol = raw.charAt(i);
+            switch (symbol) {
+                case 'W':
+                    colors.add("white");
+                    break;
+                case 'U':
+                    colors.add("blue");
+                    break;
+                case 'B':
+                    colors.add("black");
+                    break;
+                case 'R':
+                    colors.add("red");
+                    break;
+                case 'G':
+                    colors.add("green");
+                    break;
+                default:
+                    break;
+            }
+        }
+        return colors;
     }
 
     private String postJson(String path, String payload) throws IOException {
