@@ -119,20 +119,29 @@ public class ComputerPlayerOllama extends ComputerPlayerControllableProxy {
 
     private List<ActivatedAbility> collectLegalActions(Game game) {
         List<ActivatedAbility> result = new ArrayList<ActivatedAbility>();
+        List<ActivatedAbility> manaOnly = new ArrayList<ActivatedAbility>();
         List<ActivatedAbility> playable = getPlayable(game, false);
         for (ActivatedAbility ability : playable) {
             List<Ability> options = getPlayableOptions(ability, game);
             if (options.isEmpty()) {
-                result.add(ability);
+                addBridgeCandidate(ability, result, manaOnly);
                 continue;
             }
             for (Ability option : options) {
                 if (option instanceof ActivatedAbility) {
-                    result.add((ActivatedAbility) option);
+                    addBridgeCandidate((ActivatedAbility) option, result, manaOnly);
                 }
             }
         }
-        return result;
+        return result.isEmpty() ? manaOnly : result;
+    }
+
+    private void addBridgeCandidate(ActivatedAbility ability, List<ActivatedAbility> result, List<ActivatedAbility> manaOnly) {
+        if (ability.isManaAbility()) {
+            manaOnly.add(ability);
+            return;
+        }
+        result.add(ability);
     }
 
     private ActivatedAbility resolveChosenAbility(List<ActivatedAbility> playable, String actionId) {
